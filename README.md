@@ -4,6 +4,26 @@ Home Assistant custom integration for E.ON Next.
 
 > Note: This integration is being developed with the help of AI-assisted tooling, so parts of the project are intentionally being built in a fast-moving, "vibe coding" style while the integration matures.
 
+## Dashboard
+
+These pages are a Lovelace dashboard built from the sensors below. The integration does not install the dashboard for you. On a flat tariff the headline money figure is the latest statement, because these sensors do not include a daily consumption series. The account identifier is hidden on the Statement page.
+
+![Overview](docs/screenshots/dashboard-overview.png)
+
+Overview. Last bill, balance, direct debit, live unit rate, and tariff.
+
+![Electricity](docs/screenshots/dashboard-electricity.png)
+
+Electricity. Statement split, live tariff, and the latest meter reading when E.ON returns one.
+
+![Tariff and rates](docs/screenshots/dashboard-tariff.png)
+
+Tariff and rates. A flat fixed tariff stays at one price all day, so the next rate is empty.
+
+![Statement](docs/screenshots/dashboard-statement.png)
+
+Statement. Opening and closing balances, charges, credits, and payment dates.
+
 ## Current features
 
 - Live VAT-inclusive electricity import rate for half-hourly, standard, prepay, day/night, and three-rate tariffs. A standard or prepay tariff uses its single unit rate. A day/night or three-rate tariff shows the day rate as the current rate and the night rate as the next rate.
