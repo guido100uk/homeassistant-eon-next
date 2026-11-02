@@ -26,7 +26,7 @@
     "error": {
       "invalid_auth": "Invalid API key",
       "cannot_connect": "Failed to connect",
-      "unsupported_tariff": "This account does not expose a supported half-hourly tariff"
+      "unsupported_tariff": "This account does not have a usable electricity tariff"
     },
     "abort": {
       "already_configured": "Account is already configured",

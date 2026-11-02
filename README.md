@@ -6,7 +6,7 @@ Home Assistant custom integration for E.ON Next.
 
 ## Current features
 
-- Live VAT-inclusive electricity import rate
+- Live VAT-inclusive electricity import rate for half-hourly, standard, prepay, day/night, and three-rate tariffs. A standard or prepay tariff uses its single unit rate. A day/night or three-rate tariff shows the day rate as the current rate and the night rate as the next rate.
 - Next electricity import rate when E.ON publishes a later tariff window
 - Next electricity rate change timestamp when available
 - Electricity standing charge sensors including pre-VAT standing charge

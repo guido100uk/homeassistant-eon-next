@@ -1604,14 +1604,14 @@ def test_select_active_half_hourly_agreement_raises_when_no_match_exists() -> No
                 "id": "agreement-fixed",
                 "validFrom": "2026-04-01T00:00:00+00:00",
                 "validTo": "2026-05-31T00:00:00+00:00",
-                "tariff": {"__typename": "DayNightTariff"},
+                "tariff": {"__typename": "UnknownTariff"},
             }
         ]
     }
 
     with pytest.raises(
         EonNextRatesUnsupportedError,
-        match="active HalfHourlyTariff electricity agreement",
+        match="No active electricity agreement",
     ):
         select_active_half_hourly_agreement(account, datetime(2026, 5, 1, 12, 0, tzinfo=UTC))
 
@@ -2667,19 +2667,45 @@ def test_client_raises_after_single_auth_retry_fails() -> None:
         asyncio.run(client.async_discover_account_number())
 
 
-def test_build_tariff_snapshot_rejects_non_half_hourly_tariffs() -> None:
+def test_build_tariff_snapshot_accepts_standard_unit_rate() -> None:
     agreement = {
         "validFrom": "2026-04-01T00:00:00+00:00",
         "validTo": None,
         "tariff": {
-            "__typename": "DayNightTariff",
+            "__typename": "StandardTariff",
+            "displayName": "Next Flex",
+            "tariffCode": "E-1R-NEXT-FLEX",
+            "standingCharge": 50.0,
+            "unitRate": 24.5,
+        },
+    }
+
+    snapshot = build_account_snapshot(
+        _account_payload(),
+        agreement,
+        datetime(2026, 4, 30, 20, 30, tzinfo=UTC),
+    )
+
+    assert snapshot.current_rate_gbp_per_kwh == 0.245
+    assert snapshot.next_rate_gbp_per_kwh is None
+    assert snapshot.next_rate_change_at is None
+    assert snapshot.tariff_name == "Next Flex"
+    assert snapshot.standing_charge_gbp_per_day == 0.5
+
+
+def test_build_tariff_snapshot_rejects_unknown_tariff_types() -> None:
+    agreement = {
+        "validFrom": "2026-04-01T00:00:00+00:00",
+        "validTo": None,
+        "tariff": {
+            "__typename": "UnknownTariff",
             "displayName": "Legacy Two Rate",
             "tariffCode": "legacy",
             "standingCharge": 50.0,
         },
     }
 
-    with pytest.raises(EonNextRatesUnsupportedError, match="HalfHourlyTariff"):
+    with pytest.raises(EonNextRatesUnsupportedError, match="Unsupported electricity tariff"):
         build_account_snapshot(
             _account_payload(),
             agreement,

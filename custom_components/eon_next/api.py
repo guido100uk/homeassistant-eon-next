@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from aiohttp import (  # pyright: ignore[reportMissingImports]
@@ -14,6 +14,13 @@ from aiohttp import (  # pyright: ignore[reportMissingImports]
 from .const import GRAPHQL_URL
 
 _LOGGER = logging.getLogger(__name__)
+
+_HALF_HOURLY_TARIFF = "HalfHourlyTariff"
+_FLAT_TARIFFS = frozenset({"StandardTariff", "PrepayTariff"})
+_NAMED_RATE_TARIFFS = frozenset({"DayNightTariff", "ThreeRateTariff"})
+_SUPPORTED_ELECTRICITY_TARIFFS = frozenset(
+    {_HALF_HOURLY_TARIFF, *_FLAT_TARIFFS, *_NAMED_RATE_TARIFFS}
+)
 
 _HTTP_DIAGNOSTIC_HEADERS = {
     "retry-after": "retry_after",
@@ -127,11 +134,30 @@ AGREEMENTS_QUERY = """query GetHalfHourlyTariff($accountNumber: String!) {
       }
       tariff {
         __typename
-        ... on HalfHourlyTariff {
+        ... on TariffType {
           displayName
           tariffCode
           standingCharge
           preVatStandingCharge
+        }
+        ... on StandardTariff {
+          unitRate
+          preVatUnitRate
+        }
+        ... on PrepayTariff {
+          unitRate
+          preVatUnitRate
+        }
+        ... on DayNightTariff {
+          dayRate
+          nightRate
+        }
+        ... on ThreeRateTariff {
+          dayRate
+          nightRate
+          offPeakRate
+        }
+        ... on HalfHourlyTariff {
           unitRates {
             value
             validFrom
@@ -452,12 +478,12 @@ def select_active_half_hourly_agreement(account: dict, now: datetime) -> dict:
         if (
             valid_from <= now
             and (valid_to is None or now < valid_to)
-            and tariff_type == "HalfHourlyTariff"
+            and tariff_type in _SUPPORTED_ELECTRICITY_TARIFFS
         ):
             return agreement
 
     raise EonNextRatesUnsupportedError(
-        f"No active HalfHourlyTariff electricity agreement found for {now.isoformat()}"
+        f"No active electricity agreement found for {now.isoformat()}"
     )
 
 
@@ -1518,6 +1544,66 @@ def _is_auth_error(errors: list[dict[str, Any]]) -> bool:
     return False
 
 
+def _build_static_tariff_snapshot(
+    account: dict,
+    agreement: dict,
+    now: datetime,
+    tariff: dict,
+    tariff_type: str,
+) -> AccountSnapshot:
+    """Build a snapshot for a tariff that publishes one price, or day and night prices."""
+    account_number = account.get("number")
+    if account_number is None:
+        raise EonNextRatesUnsupportedError("Account payload missing required field(s): number")
+
+    price_field = "unitRate" if tariff_type in _FLAT_TARIFFS else "dayRate"
+    required_fields = ("displayName", "tariffCode", "standingCharge", price_field)
+    missing_fields = [field for field in required_fields if tariff.get(field) is None]
+    if missing_fields:
+        missing = ", ".join(missing_fields)
+        raise EonNextRatesUnsupportedError(
+            f"{tariff_type} payload missing required field(s): {missing}"
+        )
+
+    agreement_valid_from = _parse_datetime(agreement.get("validFrom"))
+    if agreement_valid_from is None:
+        raise EonNextRatesUnsupportedError(
+            "Active agreement payload missing required field(s): validFrom"
+        )
+
+    agreement_valid_to = _parse_datetime(agreement.get("validTo"))
+    window_end = (
+        agreement_valid_to
+        if agreement_valid_to is not None and agreement_valid_to > now
+        else now + timedelta(days=1)
+    )
+    next_rate = tariff.get("nightRate") if tariff_type in _NAMED_RATE_TARIFFS else None
+
+    meter_reading_fields = _latest_meter_reading_fields(agreement.get("meterPoint"))
+    billing_fields = _billing_fields(account)
+    gas_fields = _gas_fields(account, now)
+
+    return AccountSnapshot(
+        current_rate_gbp_per_kwh=_pence_to_gbp(tariff[price_field]),
+        next_rate_gbp_per_kwh=_pence_to_gbp(next_rate) if next_rate is not None else None,
+        next_rate_change_at=None,
+        account_number=account_number,
+        current_window_end=window_end,
+        next_window_start=None,
+        agreement_valid_from=agreement_valid_from,
+        agreement_valid_to=agreement_valid_to,
+        pre_vat_standing_charge_gbp_per_day=_optional_pence_to_gbp(
+            tariff.get("preVatStandingCharge")
+        ),
+        tariff_name=tariff["displayName"],
+        tariff_code=tariff["tariffCode"],
+        standing_charge_gbp_per_day=_pence_to_gbp(tariff["standingCharge"]),
+        **billing_fields,
+        **gas_fields,
+        **meter_reading_fields,
+    )
+
+
 def build_account_snapshot(account: dict, agreement: dict, now: datetime) -> AccountSnapshot:
     account_number = account.get("number")
     if account_number is None:
@@ -1525,8 +1611,12 @@ def build_account_snapshot(account: dict, agreement: dict, now: datetime) -> Acc
 
     tariff = agreement["tariff"]
     tariff_type = tariff.get("__typename")
-    if tariff_type != "HalfHourlyTariff":
-        raise EonNextRatesUnsupportedError(f"Expected HalfHourlyTariff tariff, got {tariff_type!r}")
+    if tariff_type in _FLAT_TARIFFS or tariff_type in _NAMED_RATE_TARIFFS:
+        return _build_static_tariff_snapshot(account, agreement, now, tariff, tariff_type)
+    if tariff_type != _HALF_HOURLY_TARIFF:
+        raise EonNextRatesUnsupportedError(
+            f"Unsupported electricity tariff type {tariff_type!r}"
+        )
 
     required_fields = ("unitRates", "displayName", "tariffCode", "standingCharge")
     missing_fields = [field for field in required_fields if field not in tariff]
