@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -11,15 +12,23 @@ from aiohttp import (  # pyright: ignore[reportMissingImports]
     ClientResponseError,
 )
 
-from .const import GRAPHQL_URL
+from .const import (
+    GRAPHQL_URL,
+    LOGIN_RETRY_BACKOFF,
+    LOGIN_SESSION_RESET_AFTER_FAILURES,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 _HALF_HOURLY_TARIFF = "HalfHourlyTariff"
 _FLAT_TARIFFS = frozenset({"StandardTariff", "PrepayTariff"})
 _NAMED_RATE_TARIFFS = frozenset({"DayNightTariff", "ThreeRateTariff"})
-_SUPPORTED_ELECTRICITY_TARIFFS = frozenset(
-    {_HALF_HOURLY_TARIFF, *_FLAT_TARIFFS, *_NAMED_RATE_TARIFFS}
+_SUPPORTED_ELECTRICITY_TARIFFS = _FLAT_TARIFFS | _NAMED_RATE_TARIFFS | {_HALF_HOURLY_TARIFF}
+
+# Keep this wording stable: Home Assistant only logs the first occurrence of a repeating
+# coordinator error, so a changing message would spam the log once per poll.
+LOGIN_COOLDOWN_MESSAGE = (
+    "E.ON rejected the API-key login; waiting out the retry cooldown before logging in again"
 )
 
 _HTTP_DIAGNOSTIC_HEADERS = {
@@ -460,7 +469,7 @@ def select_account_number(viewer: dict, supported_account_numbers: set[str] | No
                 return account["number"]
 
         raise EonNextRatesUnsupportedError(
-            "No supported active HalfHourlyTariff account found for the authenticated E.ON viewer"
+            "No supported active electricity account found for the authenticated E.ON viewer"
         )
 
     return accounts[0]["number"]
@@ -499,11 +508,23 @@ class EonNextRatesClient:
         token_state_callback: Callable[[str | None, int | None], None] | None = None,
         graphql_url: str = GRAPHQL_URL,
         now: Callable[[], datetime] | None = None,
+        session_factory: Callable[[], Any] | None = None,
+        login_backoff: tuple[timedelta, ...] = LOGIN_RETRY_BACKOFF,
+        login_session_reset_after_failures: int = LOGIN_SESSION_RESET_AFTER_FAILURES,
     ) -> None:
         self._session = session
         self._api_key = api_key
         self._graphql_url = graphql_url
         self._now = now or (lambda: datetime.now(UTC))
+        # A factory lets the client throw away E.ON's cookies by rebuilding the HTTP session
+        # without a config-entry reload. Without one the caller owns the session lifecycle.
+        self._session_factory = session_factory
+        self._owns_session = session_factory is not None
+        self._closed = False
+        self._login_backoff = login_backoff
+        self._login_session_reset_after_failures = login_session_reset_after_failures
+        self._login_failure_streak = 0
+        self._login_retry_after: datetime | None = None
         self._token: str | None = None
         self._token_expires_at: datetime | None = None
         self._refresh_token = refresh_token
@@ -529,9 +550,17 @@ class EonNextRatesClient:
     def refresh_token_expires_at(self) -> int | None:
         return self._refresh_token_expires_at_timestamp
 
+    @property
+    def login_failure_streak(self) -> int:
+        """Return how many API-key logins E.ON has rejected in a row."""
+        return self._login_failure_streak
+
     async def _graphql(
         self, query: str, variables: dict | None = None, token: str | None = None
     ) -> dict:
+        if self._session is None:
+            raise EonNextRatesConnectionError("The E.ON HTTP session is closed")
+
         headers = {"content-type": "application/json"}
         if token is not None:
             headers.update(authorization=f"JWT {token}")
@@ -579,11 +608,74 @@ class EonNextRatesClient:
         return data
 
     async def _async_login(self) -> str:
-        data = await self._graphql(
-            API_KEY_LOGIN_MUTATION,
-            {"input": {"APIKey": self._api_key}},
-        )
+        self._raise_if_login_cooling_down()
+
+        if (
+            self._session_factory is not None
+            and self._login_failure_streak >= self._login_session_reset_after_failures
+        ):
+            await self._async_replace_session()
+
+        try:
+            data = await self._graphql(
+                API_KEY_LOGIN_MUTATION,
+                {"input": {"APIKey": self._api_key}},
+            )
+        except EonNextRatesConnectionError as err:
+            self._start_login_cooldown(err)
+            raise
+
+        self._login_failure_streak = 0
+        self._login_retry_after = None
         return self._store_token_state(data["obtainKrakenToken"])
+
+    def _raise_if_login_cooling_down(self) -> None:
+        retry_after = self._login_retry_after
+        if retry_after is None or self._now() >= retry_after:
+            return
+
+        raise EonNextRatesConnectionError(LOGIN_COOLDOWN_MESSAGE)
+
+    def _start_login_cooldown(self, error: EonNextRatesConnectionError) -> None:
+        self._login_failure_streak += 1
+        delay = self._login_backoff[
+            min(self._login_failure_streak - 1, len(self._login_backoff) - 1)
+        ]
+        self._login_retry_after = self._now() + delay
+
+        # Log the escalation once per step rather than on every skipped poll.
+        if self._login_failure_streak <= len(self._login_backoff):
+            _LOGGER.warning(
+                "E.ON rejected the API-key login %d time(s); not retrying for %s (%s)",
+                self._login_failure_streak,
+                delay,
+                error,
+            )
+
+    async def _async_replace_session(self) -> None:
+        """Rebuild the HTTP session so E.ON's affinity and CSRF cookies are discarded."""
+        factory = self._session_factory
+        if factory is None:
+            return
+
+        previous = self._session
+        self._session = factory()
+        _LOGGER.warning(
+            "Discarding E.ON session cookies after %d rejected login attempt(s) and retrying "
+            "with a fresh HTTP session",
+            self._login_failure_streak,
+        )
+        await _close_http_session(previous)
+
+    async def async_close(self) -> None:
+        """Close the HTTP session this client created; sessions injected by a caller stay open."""
+        if not self._owns_session or self._closed:
+            return
+
+        self._closed = True
+        session = self._session
+        self._session = None
+        await _close_http_session(session)
 
     async def _async_refresh(self) -> str:
         if self._refresh_token is None:
@@ -788,6 +880,17 @@ def _parse_datetime(value: str | None) -> datetime | None:
         return None
 
     return datetime.fromisoformat(value)
+
+
+async def _close_http_session(session) -> None:
+    """Close an aiohttp-style session, tolerating fakes without ``close()``."""
+    close = getattr(session, "close", None)
+    if not callable(close):
+        return
+
+    result = close()
+    if inspect.isawaitable(result):
+        await result
 
 
 def _pence_to_gbp(value: float) -> float:
@@ -1551,13 +1654,13 @@ def _build_static_tariff_snapshot(
     tariff: dict,
     tariff_type: str,
 ) -> AccountSnapshot:
-    """Build a snapshot for a tariff that publishes one price, or day and night prices."""
+    """Build a snapshot for a single unit rate, or for day and night rates."""
     account_number = account.get("number")
     if account_number is None:
         raise EonNextRatesUnsupportedError("Account payload missing required field(s): number")
 
     price_field = "unitRate" if tariff_type in _FLAT_TARIFFS else "dayRate"
-    required_fields = ("displayName", "tariffCode", "standingCharge", price_field)
+    required_fields = (price_field, "displayName", "tariffCode", "standingCharge")
     missing_fields = [field for field in required_fields if tariff.get(field) is None]
     if missing_fields:
         missing = ", ".join(missing_fields)
@@ -1572,23 +1675,19 @@ def _build_static_tariff_snapshot(
         )
 
     agreement_valid_to = _parse_datetime(agreement.get("validTo"))
-    window_end = (
+    current_window_end = (
         agreement_valid_to
         if agreement_valid_to is not None and agreement_valid_to > now
         else now + timedelta(days=1)
     )
     next_rate = tariff.get("nightRate") if tariff_type in _NAMED_RATE_TARIFFS else None
 
-    meter_reading_fields = _latest_meter_reading_fields(agreement.get("meterPoint"))
-    billing_fields = _billing_fields(account)
-    gas_fields = _gas_fields(account, now)
-
     return AccountSnapshot(
         current_rate_gbp_per_kwh=_pence_to_gbp(tariff[price_field]),
         next_rate_gbp_per_kwh=_pence_to_gbp(next_rate) if next_rate is not None else None,
         next_rate_change_at=None,
         account_number=account_number,
-        current_window_end=window_end,
+        current_window_end=current_window_end,
         next_window_start=None,
         agreement_valid_from=agreement_valid_from,
         agreement_valid_to=agreement_valid_to,
@@ -1598,9 +1697,9 @@ def _build_static_tariff_snapshot(
         tariff_name=tariff["displayName"],
         tariff_code=tariff["tariffCode"],
         standing_charge_gbp_per_day=_pence_to_gbp(tariff["standingCharge"]),
-        **billing_fields,
-        **gas_fields,
-        **meter_reading_fields,
+        **_billing_fields(account),
+        **_gas_fields(account, now),
+        **_latest_meter_reading_fields(agreement.get("meterPoint")),
     )
 
 
@@ -1614,9 +1713,7 @@ def build_account_snapshot(account: dict, agreement: dict, now: datetime) -> Acc
     if tariff_type in _FLAT_TARIFFS or tariff_type in _NAMED_RATE_TARIFFS:
         return _build_static_tariff_snapshot(account, agreement, now, tariff, tariff_type)
     if tariff_type != _HALF_HOURLY_TARIFF:
-        raise EonNextRatesUnsupportedError(
-            f"Unsupported electricity tariff type {tariff_type!r}"
-        )
+        raise EonNextRatesUnsupportedError(f"Unsupported electricity tariff type {tariff_type!r}")
 
     required_fields = ("unitRates", "displayName", "tariffCode", "standingCharge")
     missing_fields = [field for field in required_fields if field not in tariff]
